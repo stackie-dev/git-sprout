@@ -66,6 +66,10 @@ pub struct AddCommand {
     pub orphan: bool,
     /// True when the user asked for the plain `git worktree add` path.
     pub no_cow: bool,
+    /// Create a standalone checkout with private writable Git metadata.
+    pub isolated_metadata: bool,
+    /// True when `--detach` is in effect.
+    pub detach: bool,
 }
 
 impl AddCommand {
@@ -176,6 +180,8 @@ struct AddParse {
     checkout: bool,
     orphan: bool,
     no_cow: bool,
+    isolated_metadata: bool,
+    detach: bool,
 }
 
 fn parse_add(globals: Vec<OsString>, args: &[OsString]) -> Result<AddCommand, &'static str> {
@@ -187,6 +193,8 @@ fn parse_add(globals: Vec<OsString>, args: &[OsString]) -> Result<AddCommand, &'
         checkout: true,
         orphan: false,
         no_cow: false,
+        isolated_metadata: false,
+        detach: false,
     };
 
     let mut index = 0;
@@ -214,6 +222,11 @@ fn parse_add(globals: Vec<OsString>, args: &[OsString]) -> Result<AddCommand, &'
 
         if token == "--no-cow" {
             state.no_cow = true;
+            continue;
+        }
+
+        if token == "--isolated-metadata" {
+            state.isolated_metadata = true;
             continue;
         }
 
@@ -248,6 +261,8 @@ fn parse_add(globals: Vec<OsString>, args: &[OsString]) -> Result<AddCommand, &'
         checkout: state.checkout,
         orphan: state.orphan,
         no_cow: state.no_cow,
+        isolated_metadata: state.isolated_metadata,
+        detach: state.detach,
     })
 }
 
@@ -259,6 +274,8 @@ fn parse_long(
 ) -> Result<(), &'static str> {
     if ADD_STANDALONE.contains(&token) {
         match token {
+            "--detach" => state.detach = true,
+            "--no-detach" => state.detach = false,
             "--quiet" => state.quiet = true,
             "--no-quiet" => state.quiet = false,
             "--no-checkout" => state.checkout = false,
@@ -375,6 +392,11 @@ mod tests {
         let add = add_of(&["add", "--no-cow", "../wt"]);
         assert!(add.no_cow);
         assert_eq!(strings(&add.passthrough), ["../wt"]);
+
+        let add = add_of(&["add", "--isolated-metadata", "--detach", "../wt", "HEAD"]);
+        assert!(add.isolated_metadata);
+        assert!(add.detach);
+        assert_eq!(strings(&add.passthrough), ["--detach", "../wt", "HEAD"]);
     }
 
     #[test]

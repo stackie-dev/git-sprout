@@ -102,6 +102,90 @@ pub fn add(command: &AddCommand, stats: &mut Stats) -> ExitCode {
     code
 }
 
+/// Creates an accelerated detached checkout whose Git metadata is private to the
+/// destination. Objects are borrowed from the immutable source through Git's local
+/// alternates mechanism; refs, config, index, worktree administration and submodule
+/// metadata all live beneath the destination's own `.git` directory.
+pub fn add_isolated(command: &AddCommand, stats: &mut Stats) -> ExitCode {
+    if !command.checkout || command.orphan || !command.detach || command.commit_ish.is_none() {
+        eprintln!("git-sprout: --isolated-metadata requires --detach, a commit-ish, and checkout");
+        return ExitCode::from(2);
+    }
+
+    let git = Git::new(command.globals.clone());
+    let Ok(source_root) = git.capture_line(None, ["rev-parse", "--show-toplevel"]) else {
+        eprintln!("git-sprout: could not locate the source checkout");
+        return ExitCode::from(1);
+    };
+    let source_root = source::native_worktree_path(PathBuf::from(source_root));
+    let destination = source::native_worktree_path(
+        working_directory(&command.globals).join(as_path_os(&command.path)),
+    );
+    let commit_ish = command.commit_ish.as_ref().expect("validated commit-ish");
+    let mut commit_expression = commit_ish.clone();
+    commit_expression.push("^{commit}");
+    let Ok(head) = git.capture_line(
+        None,
+        [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            commit_expression,
+        ],
+    ) else {
+        eprintln!("git-sprout: isolated commit-ish does not name a commit");
+        return ExitCode::from(1);
+    };
+
+    let before = worktrees(&git);
+    let mut clone_args = vec![
+        OsString::from("clone"),
+        OsString::from("--shared"),
+        OsString::from("--no-checkout"),
+    ];
+    if command.quiet {
+        clone_args.push(OsString::from("--quiet"));
+    }
+    clone_args.push(source_root.as_os_str().to_os_string());
+    clone_args.push(destination.as_os_str().to_os_string());
+
+    match git.passthrough(None, clone_args) {
+        Ok(status) if status.success() => {}
+        Ok(status) => return exit_code(status.code()),
+        Err(error) => {
+            eprintln!("git-sprout: could not create isolated checkout: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    let destination_git = Git::new(Vec::new());
+    let detached = destination_git.passthrough(
+        Some(&destination),
+        ["update-ref", "--no-deref", "HEAD", &head],
+    );
+    if !matches!(detached, Ok(status) if status.success()) {
+        eprintln!("git-sprout: could not detach isolated checkout at requested commit");
+        let _ = std::fs::remove_dir_all(&destination);
+        return ExitCode::from(1);
+    }
+
+    interrupt::defer();
+    let reporting = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        populate(&destination_git, &destination, &before, stats)
+    }));
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(reporting);
+    if outcome.is_err() {
+        stats.fall_back("the clone phase failed");
+    }
+    stats.emit();
+
+    let code = finish(&destination_git, &destination, command.quiet);
+    interrupt::honour();
+    code
+}
+
 /// Steps 7 and 8: git writes whatever is missing and the real index, then the checkout
 /// hook fires. `git reset --hard` is what `git worktree add` itself does at this point,
 /// down to the reflog entry, the ORIG_HEAD it leaves and the "HEAD is now at" line; it is
