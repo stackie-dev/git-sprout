@@ -72,15 +72,19 @@ pub fn add(command: &AddCommand, stats: &mut Stats) -> ExitCode {
     // or an interrupt would otherwise leave a half-populated worktree behind.
     interrupt::defer();
     if let Some(destination) = destination.as_deref() {
-        let reporting = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            populate(&git, destination, &before, stats)
-        }));
-        let _ = std::panic::take_hook();
-        std::panic::set_hook(reporting);
-        if outcome.is_err() {
-            stats.fall_back("the clone phase failed");
+        if !repair_worktree_links(&git, destination) {
+            stats.fall_back("could not reconcile the new worktree's path links");
+        } else {
+            let reporting = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                populate(&git, destination, &before, stats)
+            }));
+            let _ = std::panic::take_hook();
+            std::panic::set_hook(reporting);
+            if outcome.is_err() {
+                stats.fall_back("the clone phase failed");
+            }
         }
     } else {
         stats.fall_back("the new worktree could not be located");
@@ -176,6 +180,7 @@ fn locate(git: &Git, command: &AddCommand, before: &[source::Worktree]) -> Optio
         .map(|worktree| worktree.path);
     added.or_else(|| {
         let requested = working_directory(&command.globals).join(as_path_os(&command.path));
+        let requested = source::native_worktree_path(requested);
         requested.join(".git").exists().then_some(requested)
     })
 }
@@ -191,7 +196,31 @@ fn working_directory(globals: &[OsString]) -> PathBuf {
             }
         }
     }
-    directory
+    source::native_worktree_path(directory)
+}
+
+/// Reconciles Git-for-Windows worktree links after an MSYS junction path was requested.
+///
+/// Git's listing uses the physical drive spelling while the new worktree's `.git` file
+/// can retain the logical MSYS spelling. `git worktree repair` is Git's supported way to
+/// make those links agree; capture keeps its repair note out of normal command output.
+#[cfg(windows)]
+fn repair_worktree_links(git: &Git, destination: &Path) -> bool {
+    use std::ffi::OsStr;
+    git.capture(
+        None,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("repair"),
+            destination.as_os_str(),
+        ],
+    )
+    .is_ok()
+}
+
+#[cfg(not(windows))]
+fn repair_worktree_links(_git: &Git, _destination: &Path) -> bool {
+    true
 }
 
 fn as_path_os(path: &OsString) -> PathBuf {

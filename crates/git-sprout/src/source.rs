@@ -33,7 +33,7 @@ pub fn parse_list(output: &[u8]) -> Vec<Worktree> {
                 worktrees.push(worktree);
             }
             current = Some(Worktree {
-                path: bytes_to_path(path),
+                path: native_worktree_path(bytes_to_path(path)),
                 head: None,
                 bare: false,
                 prunable: false,
@@ -66,6 +66,43 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Converts the `/c/...` spelling emitted by Git for Windows into a native drive path.
+///
+/// Native Rust does not treat MSYS drive paths as absolute. Leaving `/w/repo` untouched
+/// makes `is_dir` reject a real checkout and makes metadata checks inspect a path relative
+/// to the process's current drive. Keep this parser platform-independent so its edge cases
+/// remain covered by the ordinary test suite.
+#[cfg(any(windows, test))]
+fn msys_drive_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'/' || !bytes[1].is_ascii_alphabetic() {
+        return None;
+    }
+    if bytes.len() > 2 && bytes[2] != b'/' {
+        return None;
+    }
+    let drive = (bytes[1] as char).to_ascii_uppercase();
+    Some(PathBuf::from(format!("{drive}:{}", &text[2..])))
+}
+
+#[cfg(windows)]
+pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
+    let path = msys_drive_path(&path).unwrap_or(path);
+    let Ok(canonical) = std::fs::canonicalize(&path) else {
+        return path;
+    };
+    let text = canonical.to_string_lossy();
+    text.strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(canonical)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// The device a path lives on, where the platform reports one.
@@ -146,6 +183,7 @@ pub fn choose(
         )
         .ok()
         .map(PathBuf::from)
+        .map(native_worktree_path)
     });
     let current_worktree = current.as_ref().and_then(|path| {
         git.capture_line(Some(path), ["rev-parse", "HEAD"])
@@ -214,6 +252,20 @@ mod tests {
         assert!(!worktrees[0].bare);
         assert!(worktrees[2].prunable);
         assert!(worktrees[3].bare);
+    }
+
+    #[test]
+    fn converts_msys_drive_paths_without_mistaking_named_roots_for_drives() {
+        assert_eq!(
+            msys_drive_path(Path::new("/w/stackie/repo")),
+            Some(PathBuf::from("W:/stackie/repo"))
+        );
+        assert_eq!(
+            msys_drive_path(Path::new("/C/Users/worker")),
+            Some(PathBuf::from("C:/Users/worker"))
+        );
+        assert_eq!(msys_drive_path(Path::new("/stackie/repo")), None);
+        assert_eq!(msys_drive_path(Path::new("relative/repo")), None);
     }
 
     #[test]
