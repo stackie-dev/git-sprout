@@ -33,7 +33,7 @@ pub fn parse_list(output: &[u8]) -> Vec<Worktree> {
                 worktrees.push(worktree);
             }
             current = Some(Worktree {
-                path: bytes_to_path(path),
+                path: native_worktree_path(bytes_to_path(path)),
                 head: None,
                 bare: false,
                 prunable: false,
@@ -66,6 +66,65 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Converts the `/c/...` spelling emitted by Git for Windows into a native drive path.
+///
+/// Native Rust does not treat MSYS drive paths as absolute. Leaving `/w/repo` untouched
+/// makes `is_dir` reject a real checkout and makes metadata checks inspect a path relative
+/// to the process's current drive. Keep this parser platform-independent so its edge cases
+/// remain covered by the ordinary test suite.
+#[cfg(any(windows, test))]
+fn msys_drive_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'/' || !bytes[1].is_ascii_alphabetic() {
+        return None;
+    }
+    if bytes.len() > 2 && bytes[2] != b'/' {
+        return None;
+    }
+    let drive = (bytes[1] as char).to_ascii_uppercase();
+    Some(PathBuf::from(format!("{drive}:{}", &text[2..])))
+}
+
+/// Converts a native drive path into the spelling Git for Windows emits and accepts.
+#[cfg(any(windows, test))]
+fn git_for_windows_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'/' | b'\\')
+    {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = text[2..].replace('\\', "/");
+    Some(PathBuf::from(format!("/{drive}{rest}")))
+}
+
+#[cfg(windows)]
+pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
+    let path = msys_drive_path(&path).unwrap_or(path);
+    let Ok(canonical) = std::fs::canonicalize(&path) else {
+        return path;
+    };
+    let text = canonical.to_string_lossy();
+    text.strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(canonical)
+}
+
+#[cfg(windows)]
+pub(crate) fn git_worktree_path(path: &Path) -> PathBuf {
+    git_for_windows_path(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// The device a path lives on, where the platform reports one.
@@ -112,6 +171,21 @@ fn in_preference_order(worktrees: &[Worktree], current: Option<&Path>) -> Vec<Wo
     ordered
 }
 
+/// Include the checkout the command is running from when Git's worktree list
+/// reports only its common git directory, as happens for absorbed submodules.
+fn include_current_checkout(worktrees: &[Worktree], current: Option<Worktree>) -> Vec<Worktree> {
+    let mut candidates = worktrees.to_vec();
+    if let Some(current) = current {
+        if !candidates
+            .iter()
+            .any(|worktree| worktree.path == current.path)
+        {
+            candidates.push(current);
+        }
+    }
+    candidates
+}
+
 /// Chooses the checkout to clone from, or `None` when none can serve.
 ///
 /// Only worktrees of the same repository on the same device qualify, because a block
@@ -131,9 +205,21 @@ pub fn choose(
         )
         .ok()
         .map(PathBuf::from)
+        .map(native_worktree_path)
     });
+    let current_worktree = current.as_ref().and_then(|path| {
+        git.capture_line(Some(path), ["rev-parse", "HEAD"])
+            .ok()
+            .map(|head| Worktree {
+                path: path.clone(),
+                head: Some(head),
+                bare: false,
+                prunable: false,
+            })
+    });
+    let worktrees = include_current_checkout(worktrees, current_worktree);
 
-    let candidates: Vec<Worktree> = in_preference_order(worktrees, current.as_deref())
+    let candidates: Vec<Worktree> = in_preference_order(&worktrees, current.as_deref())
         .into_iter()
         .filter(|worktree| !worktree.bare && !worktree.prunable)
         .filter(|worktree| worktree.path != destination)
@@ -191,6 +277,34 @@ mod tests {
     }
 
     #[test]
+    fn converts_msys_drive_paths_without_mistaking_named_roots_for_drives() {
+        assert_eq!(
+            msys_drive_path(Path::new("/w/stackie/repo")),
+            Some(PathBuf::from("W:/stackie/repo"))
+        );
+        assert_eq!(
+            msys_drive_path(Path::new("/C/Users/worker")),
+            Some(PathBuf::from("C:/Users/worker"))
+        );
+        assert_eq!(msys_drive_path(Path::new("/stackie/repo")), None);
+        assert_eq!(msys_drive_path(Path::new("relative/repo")), None);
+    }
+
+    #[test]
+    fn converts_native_drive_paths_for_git_without_changing_other_paths() {
+        assert_eq!(
+            git_for_windows_path(Path::new(r"W:\stackie\repo")),
+            Some(PathBuf::from("/w/stackie/repo"))
+        );
+        assert_eq!(
+            git_for_windows_path(Path::new("C:/Users/worker")),
+            Some(PathBuf::from("/c/Users/worker"))
+        );
+        assert_eq!(git_for_windows_path(Path::new("/stackie/repo")), None);
+        assert_eq!(git_for_windows_path(Path::new("relative/repo")), None);
+    }
+
+    #[test]
     fn prefers_the_current_checkout_then_the_main_one() {
         let worktrees = vec![
             Worktree {
@@ -216,5 +330,27 @@ mod tests {
         assert_eq!(ordered[0].path, PathBuf::from("/repo/b"));
         assert_eq!(ordered[1].path, PathBuf::from("/repo"));
         assert_eq!(ordered[2].path, PathBuf::from("/repo/a"));
+    }
+
+    #[test]
+    fn includes_an_absorbed_submodule_checkout_missing_from_gits_list() {
+        let listed = vec![Worktree {
+            path: PathBuf::from("/repo/.git/modules/sub"),
+            head: Some("abc".into()),
+            bare: false,
+            prunable: false,
+        }];
+        let current = Worktree {
+            path: PathBuf::from("/repo/sub"),
+            head: Some("abc".into()),
+            bare: false,
+            prunable: false,
+        };
+
+        let candidates = include_current_checkout(&listed, Some(current));
+        let ordered = in_preference_order(&candidates, Some(Path::new("/repo/sub")));
+
+        assert_eq!(ordered[0].path, PathBuf::from("/repo/sub"));
+        assert_eq!(ordered[1].path, PathBuf::from("/repo/.git/modules/sub"));
     }
 }

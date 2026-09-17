@@ -72,15 +72,19 @@ pub fn add(command: &AddCommand, stats: &mut Stats) -> ExitCode {
     // or an interrupt would otherwise leave a half-populated worktree behind.
     interrupt::defer();
     if let Some(destination) = destination.as_deref() {
-        let reporting = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            populate(&git, destination, &before, stats)
-        }));
-        let _ = std::panic::take_hook();
-        std::panic::set_hook(reporting);
-        if outcome.is_err() {
-            stats.fall_back("the clone phase failed");
+        if !repair_worktree_links(&git, destination) {
+            stats.fall_back("could not reconcile the new worktree's path links");
+        } else {
+            let reporting = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                populate(&git, destination, &before, stats)
+            }));
+            let _ = std::panic::take_hook();
+            std::panic::set_hook(reporting);
+            if outcome.is_err() {
+                stats.fall_back("the clone phase failed");
+            }
         }
     } else {
         stats.fall_back("the new worktree could not be located");
@@ -176,6 +180,7 @@ fn locate(git: &Git, command: &AddCommand, before: &[source::Worktree]) -> Optio
         .map(|worktree| worktree.path);
     added.or_else(|| {
         let requested = working_directory(&command.globals).join(as_path_os(&command.path));
+        let requested = source::native_worktree_path(requested);
         requested.join(".git").exists().then_some(requested)
     })
 }
@@ -191,7 +196,32 @@ fn working_directory(globals: &[OsString]) -> PathBuf {
             }
         }
     }
-    directory
+    source::native_worktree_path(directory)
+}
+
+/// Reconciles Git-for-Windows worktree links after an MSYS junction path was requested.
+///
+/// Git's listing uses the physical drive spelling while the new worktree's `.git` file
+/// can retain the logical MSYS spelling. `git worktree repair` is Git's supported way to
+/// make those links agree; capture keeps its repair note out of normal command output.
+#[cfg(windows)]
+fn repair_worktree_links(git: &Git, destination: &Path) -> bool {
+    use std::ffi::OsStr;
+    let destination = source::git_worktree_path(destination);
+    git.capture(
+        None,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("repair"),
+            destination.as_os_str(),
+        ],
+    )
+    .is_ok()
+}
+
+#[cfg(not(windows))]
+fn repair_worktree_links(_git: &Git, _destination: &Path) -> bool {
+    true
 }
 
 fn as_path_os(path: &OsString) -> PathBuf {
@@ -226,7 +256,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
         stats.fall_back("could not locate the new worktree's index");
         return;
     };
-    let destination_index = PathBuf::from(destination_index);
+    let destination_index = source::native_worktree_path(PathBuf::from(destination_index));
     let version = scratch_index::default_version(
         std::env::var("GIT_INDEX_VERSION").ok().as_deref(),
         git.config(destination, "index.version").as_deref(),
@@ -278,7 +308,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
         return;
     };
     let Ok(source_index) = gix_index::File::at(
-        PathBuf::from(index_path),
+        source::native_worktree_path(PathBuf::from(index_path)),
         object_hash,
         true,
         gix_index::decode::Options::default(),
@@ -307,12 +337,24 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
 
     let mut verified = plan::verify_paths(&target, &source_index, &source, &poisoned, &colliding);
     let considered = verified.considered;
+    diagnostic_counts(
+        "verified",
+        considered,
+        verified.paths.len(),
+        verified.racy.len(),
+    );
     let racy_paths: Vec<Vec<u8>> = verified
         .racy
         .iter()
         .map(|planned| planned.path.clone())
         .collect();
     let changed = changed_paths(git, &source, &racy_paths);
+    diagnostic_counts(
+        "git-checked",
+        considered,
+        verified.paths.len(),
+        changed.len(),
+    );
     verified.paths.extend(
         verified
             .racy
@@ -322,6 +364,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
     );
     verified.paths.sort_by(|a, b| a.path.cmp(&b.path));
     drop_converted_paths(git, &source, &mut verified.paths);
+    diagnostic_counts("convertible", considered, verified.paths.len(), 0);
 
     let plan = plan::assemble(
         &target,
@@ -354,6 +397,32 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
 
     if scratch_index::write(&destination_index, object_hash, &records).is_err() {
         stats.fall_back("could not write the scratch index");
+    } else if !refresh_windows_index(git, destination) {
+        stats.fall_back("could not refresh the Windows scratch index");
+    }
+}
+
+/// Lets Git for Windows replace native-Rust zero placeholders for MSYS-only stat fields.
+/// Without this refresh, the following reset treats every cloned path as stale and writes
+/// it again, discarding the ReFS block clones that were just created.
+#[cfg(windows)]
+fn refresh_windows_index(git: &Git, destination: &Path) -> bool {
+    git.capture(Some(destination), ["update-index", "--really-refresh"])
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn refresh_windows_index(_git: &Git, _destination: &Path) -> bool {
+    true
+}
+
+/// Emits aggregate diagnostics only when explicitly requested. Paths and file content are
+/// deliberately omitted so this can be used on production-shaped workers safely.
+fn diagnostic_counts(stage: &str, considered: usize, accepted: usize, auxiliary: usize) {
+    if std::env::var_os("SPROUT_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "git-sprout-diagnostic: stage={stage} considered={considered} accepted={accepted} auxiliary={auxiliary}"
+        );
     }
 }
 
@@ -390,7 +459,7 @@ fn worktree_attributes(git: &Git, worktree: &Path) -> Option<Vec<u8>> {
             ],
         )
         .ok()?;
-    std::fs::read(path).ok()
+    std::fs::read(source::native_worktree_path(PathBuf::from(path))).ok()
 }
 
 /// Removes the paths a checkout would rewrite on its way to the working tree.
