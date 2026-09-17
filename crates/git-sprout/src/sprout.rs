@@ -397,7 +397,23 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
 
     if scratch_index::write(&destination_index, object_hash, &records).is_err() {
         stats.fall_back("could not write the scratch index");
+    } else if !refresh_windows_index(git, destination) {
+        stats.fall_back("could not refresh the Windows scratch index");
     }
+}
+
+/// Lets Git for Windows replace native-Rust zero placeholders for MSYS-only stat fields.
+/// Without this refresh, the following reset treats every cloned path as stale and writes
+/// it again, discarding the ReFS block clones that were just created.
+#[cfg(windows)]
+fn refresh_windows_index(git: &Git, destination: &Path) -> bool {
+    git.capture(Some(destination), ["update-index", "--really-refresh"])
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn refresh_windows_index(_git: &Git, _destination: &Path) -> bool {
+    true
 }
 
 /// Emits aggregate diagnostics only when explicitly requested. Paths and file content are
