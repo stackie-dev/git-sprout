@@ -337,12 +337,24 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
 
     let mut verified = plan::verify_paths(&target, &source_index, &source, &poisoned, &colliding);
     let considered = verified.considered;
+    diagnostic_counts(
+        "verified",
+        considered,
+        verified.paths.len(),
+        verified.racy.len(),
+    );
     let racy_paths: Vec<Vec<u8>> = verified
         .racy
         .iter()
         .map(|planned| planned.path.clone())
         .collect();
     let changed = changed_paths(git, &source, &racy_paths);
+    diagnostic_counts(
+        "git-checked",
+        considered,
+        verified.paths.len(),
+        changed.len(),
+    );
     verified.paths.extend(
         verified
             .racy
@@ -352,6 +364,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
     );
     verified.paths.sort_by(|a, b| a.path.cmp(&b.path));
     drop_converted_paths(git, &source, &mut verified.paths);
+    diagnostic_counts("convertible", considered, verified.paths.len(), 0);
 
     let plan = plan::assemble(
         &target,
@@ -384,6 +397,16 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
 
     if scratch_index::write(&destination_index, object_hash, &records).is_err() {
         stats.fall_back("could not write the scratch index");
+    }
+}
+
+/// Emits aggregate diagnostics only when explicitly requested. Paths and file content are
+/// deliberately omitted so this can be used on production-shaped workers safely.
+fn diagnostic_counts(stage: &str, considered: usize, accepted: usize, auxiliary: usize) {
+    if std::env::var_os("SPROUT_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "git-sprout-diagnostic: stage={stage} considered={considered} accepted={accepted} auxiliary={auxiliary}"
+        );
     }
 }
 
