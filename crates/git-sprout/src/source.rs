@@ -88,6 +88,23 @@ fn msys_drive_path(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(format!("{drive}:{}", &text[2..])))
 }
 
+/// Converts a native drive path into the spelling Git for Windows emits and accepts.
+#[cfg(any(windows, test))]
+fn git_for_windows_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'/' | b'\\')
+    {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = text[2..].replace('\\', "/");
+    Some(PathBuf::from(format!("/{drive}{rest}")))
+}
+
 #[cfg(windows)]
 pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
     let path = msys_drive_path(&path).unwrap_or(path);
@@ -98,6 +115,11 @@ pub(crate) fn native_worktree_path(path: PathBuf) -> PathBuf {
     text.strip_prefix(r"\\?\")
         .map(PathBuf::from)
         .unwrap_or(canonical)
+}
+
+#[cfg(windows)]
+pub(crate) fn git_worktree_path(path: &Path) -> PathBuf {
+    git_for_windows_path(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 #[cfg(not(windows))]
@@ -266,6 +288,20 @@ mod tests {
         );
         assert_eq!(msys_drive_path(Path::new("/stackie/repo")), None);
         assert_eq!(msys_drive_path(Path::new("relative/repo")), None);
+    }
+
+    #[test]
+    fn converts_native_drive_paths_for_git_without_changing_other_paths() {
+        assert_eq!(
+            git_for_windows_path(Path::new(r"W:\stackie\repo")),
+            Some(PathBuf::from("/w/stackie/repo"))
+        );
+        assert_eq!(
+            git_for_windows_path(Path::new("C:/Users/worker")),
+            Some(PathBuf::from("/c/Users/worker"))
+        );
+        assert_eq!(git_for_windows_path(Path::new("/stackie/repo")), None);
+        assert_eq!(git_for_windows_path(Path::new("relative/repo")), None);
     }
 
     #[test]

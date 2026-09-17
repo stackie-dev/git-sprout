@@ -207,6 +207,7 @@ fn working_directory(globals: &[OsString]) -> PathBuf {
 #[cfg(windows)]
 fn repair_worktree_links(git: &Git, destination: &Path) -> bool {
     use std::ffi::OsStr;
+    let destination = source::git_worktree_path(destination);
     git.capture(
         None,
         [

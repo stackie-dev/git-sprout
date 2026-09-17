@@ -101,7 +101,14 @@ pub fn stat_verdict(
         return Verdict::Reject;
     };
     if !on_disk.matches(&entry.stat, stat_options()) {
-        return Verdict::Reject;
+        // Git for Windows records the MSYS device, inode, uid and gid in the index,
+        // while native Windows metadata deliberately reports those unavailable fields
+        // as zero. Let Git compare the content instead of rejecting every such entry.
+        return if cfg!(windows) {
+            Verdict::AskGit
+        } else {
+            Verdict::Reject
+        };
     }
     if entry.stat.is_racy(index_timestamp, stat_options()) {
         return Verdict::AskGit;
