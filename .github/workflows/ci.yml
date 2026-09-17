@@ -36,5 +36,14 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
 
+      - name: Upload candidate binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: git-sprout-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            target/release/git-sprout
+            target/release/git-sprout.exe
+          if-no-files-found: error
+
       - name: Test
         run: cargo test --release --workspace
