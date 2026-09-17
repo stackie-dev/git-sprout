@@ -31,6 +31,9 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Invocation::Delegate { git_args, reason } => (git_args, reason.to_string()),
+        Invocation::Add(add) if add.isolated_metadata => {
+            return sprout::add_isolated(&add, &mut stats);
+        }
         Invocation::Add(add) => match decline(&add) {
             Some(reason) => (add.git_args(), reason),
             None => return sprout::add(&add, &mut stats),
