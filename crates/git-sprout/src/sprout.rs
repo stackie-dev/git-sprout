@@ -256,7 +256,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
         stats.fall_back("could not locate the new worktree's index");
         return;
     };
-    let destination_index = PathBuf::from(destination_index);
+    let destination_index = source::native_worktree_path(PathBuf::from(destination_index));
     let version = scratch_index::default_version(
         std::env::var("GIT_INDEX_VERSION").ok().as_deref(),
         git.config(destination, "index.version").as_deref(),
@@ -308,7 +308,7 @@ fn populate(git: &Git, destination: &Path, before: &[source::Worktree], stats: &
         return;
     };
     let Ok(source_index) = gix_index::File::at(
-        PathBuf::from(index_path),
+        source::native_worktree_path(PathBuf::from(index_path)),
         object_hash,
         true,
         gix_index::decode::Options::default(),
@@ -443,7 +443,7 @@ fn worktree_attributes(git: &Git, worktree: &Path) -> Option<Vec<u8>> {
             ],
         )
         .ok()?;
-    std::fs::read(path).ok()
+    std::fs::read(source::native_worktree_path(PathBuf::from(path))).ok()
 }
 
 /// Removes the paths a checkout would rewrite on its way to the working tree.
